@@ -1,4 +1,4 @@
-const {Server} = require("socket.io");
+const { Server } = require("socket.io");
 const cookie = require("cookie");
 const jwt = require("jsonwebtoken");
 const generateContent = require("../service/ai.service");
@@ -8,6 +8,7 @@ const messageModel = require("../model/message.model");
 function initSocketServer(httpServer) {
   const io = new Server(httpServer, {});
 
+  // Middleware for authentication
   io.use(async (socket, next) => {
     const parsedCookies = cookie.parse(socket.handshake.headers.cookie || "");
 
@@ -28,27 +29,48 @@ function initSocketServer(httpServer) {
 
   io.on("connection", (socket) => {
     socket.on("ai-message", async (msg) => {
-      await messageModel.create({
-        user: socket.user._id,
-        chat: msg.chat,
-        content: msg.content,
-        role: "user",
-      });
+      try {
+        // ✅ Save user message
+        await messageModel.create({
+          user: socket.user._id,
+          chat: msg.chat,
+          content: msg.content,
+          role: "user",
+        });
 
-      console.log("Full msg object:", msg);
+        // ✅ Fetch chat history (last 20 messages)
+        const chatHistory = (
+          await messageModel
+            .find({ chat: msg.chat })
+            .sort({ createdAt: -1 })
+            .limit(20)
+        ).reverse();
 
-      const res = await generateContent(msg.content);
+        // ✅ Generate AI response
+        const res = await generateContent(
+          chatHistory.map((item) => ({
+            role: item.role,
+            parts: [{ text: item.content }],
+          }))
+        );
 
-      await messageModel.create({
-        content: res,
-        role: "model",
-      });
+        // ✅ Save AI response in the same chat
+        await messageModel.create({
+          chat: msg.chat,
+          content: res,
+          role: "model",
+        });
 
-      socket.emit("ai-response", {
-        content: res,
-        chatID: msg.chat,
-      });
-      console.log(res);
+        // ✅ Send response back to the client
+        socket.emit("ai-response", {
+          chatID: msg.chat,
+          content: res,
+        });
+
+        console.log("Chat history updated:", chatHistory);
+      } catch (error) {
+        console.error("Error handling ai-message:", error);
+      }
     });
   });
 }
