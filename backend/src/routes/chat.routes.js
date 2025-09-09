@@ -8,3 +8,4 @@ const router = express.Router();
 router.post("/", authMiddleware.authUser, chatControllers.createChat);
 
 module.exports = router;
+ 

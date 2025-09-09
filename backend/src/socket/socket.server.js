@@ -1,28 +1,30 @@
 const { Server } = require("socket.io");
 const cookie = require("cookie");
 const jwt = require("jsonwebtoken");
-const generateContent = require("../service/ai.service");
+const { generateContent, generateVectors } = require("../service/ai.service");
 const userModel = require("../model/auth.model");
 const messageModel = require("../model/message.model");
+const { queryMemory, createMemory } = require("../service/vector.service");
+const { v4: uuidv4 } = require("uuid");
 
-function initSocketServer(httpServer) {
+async function initSocketServer(httpServer) {
   const io = new Server(httpServer, {});
 
-  // Middleware for authentication
+  // middleware for auth
   io.use(async (socket, next) => {
-    const parsedCookies = cookie.parse(socket.handshake.headers.cookie || "");
-
-    if (!parsedCookies.token) {
-      return next(new Error("Authentication error: No token provided"));
-    }
-
     try {
-      const decoded = jwt.verify(parsedCookies.token, process.env.JWT_SECRET);
-      const user = await userModel.findById(decoded.id);
-      socket.user = user;
+      const parsedCookie = cookie.parse(socket.handshake.headers.cookie || "");
+      const token = parsedCookie.token;
 
+      if (!token) return next(new Error("Authentication error: No token"));
+
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await userModel.findById(decoded.id);
+      if (!user) return next(new Error("Authentication error: User not found"));
+
+      socket.user = user;
       next();
-    } catch (error) {
+    } catch (err) {
       return next(new Error("Authentication error: Invalid token"));
     }
   });
@@ -30,15 +32,21 @@ function initSocketServer(httpServer) {
   io.on("connection", (socket) => {
     socket.on("ai-message", async (msg) => {
       try {
-        // ✅ Save user message
+        // save user msg
         await messageModel.create({
-          user: socket.user._id,
           chat: msg.chat,
+          user: socket.user._id,
           content: msg.content,
           role: "user",
         });
 
-        // ✅ Fetch chat history (last 20 messages)
+        // vectorize
+        const vector = await generateVectors(msg.content);
+
+        // query memory
+        const memory = await queryMemory({ queryVector: vector, limit: 3 });
+
+        // get last 20 messages
         const chatHistory = (
           await messageModel
             .find({ chat: msg.chat })
@@ -46,33 +54,44 @@ function initSocketServer(httpServer) {
             .limit(20)
         ).reverse();
 
-        // ✅ Generate AI response
-        const res = await generateContent(
-          chatHistory.map((item) => ({
-            role: item.role,
-            parts: [{ text: item.content }],
-          }))
-        );
+        // build context
+        const stm = chatHistory.map((item) => ({
+          role: item.role,
+          parts: [{ text: item.content }],
+        }));
 
-        // ✅ Save AI response in the same chat
+        // generate response
+        const response = await generateContent(stm);
+
+        // save AI response
         await messageModel.create({
           chat: msg.chat,
-          content: res,
+          content: response,
           role: "model",
         });
 
-        // ✅ Send response back to the client
+        // send to client
         socket.emit("ai-response", {
-          chatID: msg.chat,
-          content: res,
+          chatId: msg.chat,
+          content: response,
         });
 
-        console.log("Chat history updated:", chatHistory);
-      } catch (error) {
-        console.error("Error handling ai-message:", error);
+        // store in memory
+        await createMemory({
+          vectors: vector,
+          messageID: uuidv4(),
+          metadata: {
+            chat: msg.chat,
+            user: socket.user._id.toString(),
+            text: msg.content,
+          },
+        });
+      } catch (err) {
+        console.error("Error handling ai-message:", err);
       }
     });
   });
 }
 
 module.exports = initSocketServer;
+

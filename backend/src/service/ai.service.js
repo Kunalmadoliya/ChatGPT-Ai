@@ -1,4 +1,4 @@
-const { GoogleGenAI } = require("@google/genai");
+const {GoogleGenAI} = require("@google/genai");
 
 const ai = new GoogleGenAI({});
 
@@ -7,10 +7,20 @@ async function generateContent(prompt) {
     model: "gemini-2.5-flash",
     contents: prompt,
   });
-  
-  return response.text
+
+  return response.text;
 }
 
-module.exports = generateContent
+async function generateVectors(prompt) {
+  const response = await ai.models.embedContent({
+    model: "gemini-embedding-001",
+    contents: prompt,
+    config: {
+      outputDimensionality: 768,
+    },
+  });
 
+  return response.embeddings[0].values;
+}
 
+module.exports = {generateContent, generateVectors};
