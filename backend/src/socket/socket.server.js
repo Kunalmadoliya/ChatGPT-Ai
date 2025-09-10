@@ -15,7 +15,6 @@ async function initSocketServer(httpServer) {
     try {
       const parsedCookie = cookie.parse(socket.handshake.headers.cookie || "");
       const token = parsedCookie.token;
-
       if (!token) return next(new Error("Authentication error: No token"));
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -32,58 +31,92 @@ async function initSocketServer(httpServer) {
   io.on("connection", (socket) => {
     socket.on("ai-message", async (msg) => {
       try {
-        // save user msg
-        await messageModel.create({
-          chat: msg.chat,
-          user: socket.user._id,
-          content: msg.content,
-          role: "user",
+        // Save user message + vectorize
+        const [message, vector] = await Promise.all([
+          messageModel.create({
+            chat: msg.chat,
+            user: socket.user._id,
+            content: msg.content,
+            role: "user",
+          }),
+          generateVectors(msg.content),
+        ]);
+
+        // Store user message in Pinecone
+        await createMemory({
+          vectors: vector,
+          messageID: message._id.toString(),
+          metadata: {
+            chat: msg.chat,
+            user: socket.user._id.toString(),
+            content: msg.content,
+          },
         });
 
-        // vectorize
-        const vector = await generateVectors(msg.content);
-
-        // query memory
-        const memory = await queryMemory({ queryVector: vector, limit: 3 });
-
-        // get last 20 messages
-        const chatHistory = (
-          await messageModel
+        // Query Pinecone + fetch history
+        const [memory, chatHistory] = await Promise.all([
+          queryMemory({
+            queryVector: vector,
+            limit: 3,
+            metadata: { user: socket.user._id.toString() },
+          }),
+          messageModel
             .find({ chat: msg.chat })
             .sort({ createdAt: -1 })
             .limit(20)
-        ).reverse();
+            .lean()
+            .then((messages) => messages.reverse()),
+        ]);
 
-        // build context
+        // Format context
         const stm = chatHistory.map((item) => ({
           role: item.role,
           parts: [{ text: item.content }],
         }));
 
-        // generate response
-        const response = await generateContent(stm);
+        const ltm = [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `
+These are some previous messages from the chat, use them to generate a response:
 
-        // save AI response
-        await messageModel.create({
-          chat: msg.chat,
-          content: response,
-          role: "model",
-        });
+${memory.map((item) => item.metadata.content).join("\n")}
+                `,
+              },
+            ],
+          },
+        ];
 
-        // send to client
+        // Generate AI response
+        const response = await generateContent([...ltm, ...stm]);
+
+        // Send to client
         socket.emit("ai-response", {
           chatId: msg.chat,
           content: response,
         });
 
-        // store in memory
+        // Save AI response + vectorize
+        const [responseMessage, responseVector] = await Promise.all([
+          messageModel.create({
+            chat: msg.chat,
+            user: socket.user._id,
+            content: response,
+            role: "model",
+          }),
+          generateVectors(response),
+        ]);
+
+        // Store AI response in Pinecone
         await createMemory({
-          vectors: vector,
-          messageID: uuidv4(),
+          vectors: responseVector,
+          messageID: responseMessage._id.toString(),
           metadata: {
             chat: msg.chat,
             user: socket.user._id.toString(),
-            text: msg.content,
+            content: response,
           },
         });
       } catch (err) {
@@ -94,4 +127,3 @@ async function initSocketServer(httpServer) {
 }
 
 module.exports = initSocketServer;
-
